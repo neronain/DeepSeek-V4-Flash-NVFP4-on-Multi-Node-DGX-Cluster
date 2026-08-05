@@ -1,165 +1,105 @@
----
+# DeepSeek-V4-Flash NVFP4 บนคลัสเตอร์ DGX หลายเครื่อง
 
-# 🚀 Deploying DeepSeek-V4-Flash-NVFP4 on Multi-Node DGX Cluster (Grace Blackwell)
+> รันบน **DGX Spark (GB10) × 2 เครื่อง** · vLLM (Docker, stacked)
+> ทดสอบจริงโดย **neronain** · <https://www.facebook.com/neronain.minidev>
 
-บทความและคู่มือนี้อธิบายขั้นตอนการ Deploy โมเดล **DeepSeek-V4-Flash-NVFP4** แบบ Multi-Node ผ่านการทำงานร่วมกันของ **SGLang** และ **Ray Cluster** โดยใช้เครื่องเซิร์ฟเวอร์ NVIDIA DGX สถาปัตยกรรม Grace Blackwell (GB10) จำนวน 2 เครื่อง เชื่อมต่อกันผ่านเครือข่ายความเร็วสูง RoCEv2 (RDMA)
-
-📌 1. System Architecture & Hardware
-
-* **Model:** `nvidia/DeepSeek-V4-Flash-NVFP4` (ใช้ Data Type NVFP4 ซึ่งรีดประสิทธิภาพสูงสุดบนชิปตระกูล Blackwell)
-* **Engine:** SGLang (High-performance inference engine) รองรับ TensorRT-LLM และ FlashInfer
-* **Cluster Manager:** Ray
-* **Hardware:** 2x NVIDIA DGX (Grace Blackwell - GB10) - *1 GPU / Node*
-* **Networking:** RoCEv2 (InfiniBand/RDMA) เพื่อให้กระบวนการ Tensor Parallelism (TP) ข้ามเครื่องทำงานได้โดยไม่มีคอขวด (Zero-copy network)
+🇬🇧 English: [README.en.md](README.en.md)
 
 ---
 
-## 🛠️ 2. Prerequisites & Network Setup
+## สรุปใน 30 วินาที
 
-ก่อนเริ่มการรันคอนเทนเนอร์ ต้องตรวจสอบการตั้งค่าเครือข่ายและสิทธิ์การใช้งานดังนี้:
+| | |
+|---|---|
+| โมเดล | `nvidia/DeepSeek-V4-Flash-NVFP4` |
+| Engine | vLLM (Docker, stacked) |
+| Runtime image | `ghcr.io/anemll/dspark-vllm-gx10:0.1.1` |
+| ฮาร์ดแวร์ที่ทดสอบ | DGX Spark (GB10) × 2 เครื่อง |
+| หน่วยความจำที่ต้องมี | ~157 GB (NVFP4) แบ่ง TP=2 |
+| ฟีเจอร์ | reasoning · tools · kv-cache fp8 · context ยาว |
 
-1. **High-Speed Network (RoCEv2):** ตรวจสอบ Interfaces สำหรับการคุยกันข้ามโหนด (ในที่นี้คือ `enp1s0f1np1`)
-2. **Master Node IP:** `10.100.152.1`
-3. **Worker Node IP:** `10.100.152.2`
-4. **Hugging Face Token:** จำเป็นสำหรับการโหลดโมเดล (ตั้งเป็น Environment Variable `.env` หรือส่งตรงผ่าน Docker Compose)
+โมเดล MoE ขนาดใหญ่ที่ NVFP4 แล้วยังต้องใช้สองเครื่อง — เอกสารนี้เน้นสิ่งที่ทำให้ start ไม่ผ่าน
+ซึ่งเจอจากการรันจริง ไม่ใช่ทฤษฎี
 
----
+**สามอย่างที่ต้องถูกพร้อมกัน ไม่งั้นไม่ขึ้น:**
 
-## 🐳 3. Docker Compose Configuration
-
-สร้างไฟล์ `docker-compose.yml` สำหรับทั้ง 2 โหนด โดยหัวใจสำคัญคือการส่งต่อ Environment Variables ของ `NCCL` (NVIDIA Collective Communications Library) เพื่อให้ GPU คุยกันข้ามเครือข่ายได้
-
-### Master Node (`10.100.152.1`)
-
-```yaml
-services:
-  sglang-master:
-    image: lmsysorg/sglang:latest
-    container_name: sglang-master
-    network_mode: "host"
-    ipc: "host"
-    privileged: true
-    environment:
-      - NCCL_SOCKET_IFNAME=enp1s0f1np1,enP2p1s0f1np1
-      - NCCL_IB_HCA=rocep1s0f1,roceP2p1s0f1
-      - NCCL_IB_DISABLE=0
-      - NCCL_NET_GDR_LEVEL=2
-      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
-    volumes:
-      - /home/neronain/.cache/huggingface:/root/.cache/huggingface
-      - /dev/shm:/dev/shm
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ['all']
-              capabilities: [gpu]
-    command: >
-      bash -c "pip install 'ray[default]' && ray start --head --port=6379 && sleep infinity"
-
-```
-
-### Worker Node (`10.100.152.2`)
-
-```yaml
-services:
-  sglang-worker:
-    image: lmsysorg/sglang:latest
-    container_name: sglang-worker
-    network_mode: "host"
-    ipc: "host"
-    privileged: true
-    environment:
-      # ใช้การตั้งค่า NCCL เหมือน Master Node
-      - NCCL_SOCKET_IFNAME=enp1s0f1np1,enP2p1s0f1np1
-      - NCCL_IB_HCA=rocep1s0f1,roceP2p1s0f1
-      - NCCL_IB_DISABLE=0
-      - NCCL_NET_GDR_LEVEL=2
-      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
-    volumes:
-      - /home/neronain/.cache/huggingface:/root/.cache/huggingface
-      - /dev/shm:/dev/shm
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ['all']
-              capabilities: [gpu]
-    command: >
-      bash -c "pip install 'ray[default]' && ray start --address='10.100.152.1:6379' && sleep infinity"
-
-```
+1. **image** — ต้องเป็น build ที่มี kernel ของ DeepSeek V4 (`dspark-vllm-gx10`)
+   image vLLM ทั่วไปไม่มี
+2. **`--kv-cache-dtype fp8`** — attention layout `fp8_ds_mla` ไม่รับ `auto`
+   (`AssertionError: only supports fp8 kv-cache, got auto`)
+3. **cache layout** — weight ที่โหลดด้วย HF รุ่นเก่าอยู่ที่ `$HF_HOME/models--…` ไม่ใช่ `hub/`
+   ถ้าไม่ตั้ง `HF_HUB_CACHE` ให้ตรงจะได้ `LocalEntryNotFoundError` ทั้งที่ไฟล์ครบทุกไฟล์
 
 ---
 
-## 🚀 4. Deployment Steps
+## วิธีที่แนะนำ: ใช้ LMDS สร้างให้
 
-### Step 4.1: Start Ray Cluster
-
-รัน Docker Compose ในแต่ละเครื่องเพื่อสร้าง Ray Cluster เบื้องหลัง
+[LMDS](https://github.com/neronain/AutoDeployDGXProject) เก็บ**สูตรของโมเดลนี้ไว้ในตัวโปรแกรมแล้ว**
+— ค่า image / parser / quantization ที่หน้านี้อธิบาย ถูกใส่ให้อัตโนมัติ **โดยไม่ต้องมี API key ของ LLM**
 
 ```bash
-# รันที่ Master และ Worker
-sudo docker compose up -d
-
+lmds recipes nvidia/DeepSeek-V4-Flash-NVFP4          # ดูสูตร + ที่มา
+lmds deploy nvidia/DeepSeek-V4-Flash-NVFP4 \
+  --target dgx-spark-stacked --no-llm --yes
 ```
 
-ตรวจสอบสถานะ Cluster (รันที่ Master):
+ได้ controller มาตรฐาน (ผ่าน `audit-controllers.py` 0 error 0 warning) ที่มีครบทั้ง
+`download` · `verify-files` · `start` · `stop` · `status` · `logs` · `test-text` · `doctor`
+
+### ใช้ LMDS จัดการทั้งคลัสเตอร์
 
 ```bash
-sudo docker exec -it sglang-master ray status
-
+lmds node cluster --write deepseek-v4-flash-nvfp4 --on spark-head
+./deepseek-v4-flash-nvfp4-stacked.sh prepare-runtime
+./deepseek-v4-flash-nvfp4-stacked.sh verify-files
+./deepseek-v4-flash-nvfp4-stacked.sh sync-worker && ./deepseek-v4-flash-nvfp4-stacked.sh verify-worker
+./deepseek-v4-flash-nvfp4-stacked.sh start --gpu-util 0.80
 ```
 
-*ผลลัพธ์ที่คาดหวัง: จำนวน Node ที่ Active ต้องเท่ากับ 2 และมองเห็นทรัพยากร GPU รวมกันทั้งหมด (Total Usage: 0.0/2.0 GPU)*
-
-### Step 4.2: Launch DeepSeek-V4 via SGLang
-
-เมื่อ Cluster พร้อม ให้สั่งรันเซิร์ฟเวอร์จาก Master Node โดยใช้คำสั่ง `sglang serve` พร้อมกำหนด Tensor Parallelism (`--tp 2`) และบอกให้ระบบรู้ว่าเรากระจายงานข้าม 2 โหนด (`--nnodes 2`)
-
-```bash
-sudo docker exec -it sglang-master bash -c "sglang serve \
-  --model-path nvidia/DeepSeek-V4-Flash-NVFP4 \
-  --tp 2 \
-  --use-ray \
-  --nnodes 2 \
-  --trust-remote-code \
-  --host 0.0.0.0 \
-  --port 8080"
-
-```
-
-*ระบบจะทำการดาวน์โหลด Weights ไปเก็บไว้ที่ `/root/.cache/huggingface` และกระจายโหลดไปยัง GPU ทั้ง 2 เครื่องผ่าน NCCL*
+controller ตั้ง `HF_HUB_CACHE` ให้ตรงกับ layout เอง และหา NCCL interface + RoCE HCA จาก cluster IP
+— ไม่ต้องย้ายไฟล์หรือกรอกชื่อ interface
 
 ---
 
-## 🧪 5. Testing the Inference API
-
-เมื่อเซิร์ฟเวอร์รันสำเร็จ (ขึ้นข้อความ `Uvicorn running on [http://0.0.0.0:8080](http://0.0.0.0:8080)`) สามารถทดสอบยิง API ได้ตามมาตรฐาน OpenAI:
+## ตรวจว่าใช้งานได้จริง
 
 ```bash
-curl http://10.100.152.1:8080/generate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text": "What are the advantages of Grace Blackwell architecture?",
-    "sampling_params": {
-      "max_new_tokens": 512,
-      "temperature": 0.7
-    }
-  }'
-
+curl -s http://localhost:8000/v1/models | jq .
+curl -s http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek-v4-flash-nvfp4","messages":[{"role":"user","content":"2+2=?"}],"max_tokens":32}'
 ```
 
----
-
-## 📚 6. Reference & Documentation
-
-* **DeepSeek-V4 on Hugging Face:** [nvidia/DeepSeek-V4-Flash-NVFP4](https://huggingface.co/nvidia/DeepSeek-V4-Flash-NVFP4)
-* **SGLang GitHub Repository:** [lmsysorg/sglang](https://github.com/sgl-project/sglang)
-* **NVIDIA SGLang Playbooks:** [DGX Spark Playbooks - SGLang](https://github.com/NVIDIA/dgx-spark-playbooks/tree/main/nvidia/sglang)
-* **Multi-Node Spark Connection Guide:** [Connect Two Sparks](https://github.com/NVIDIA/dgx-spark-playbooks/tree/main/nvidia/connect-two-sparks)
-* **NVIDIA NCCL Documentation:** [NCCL Environment Variables](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html)
+ถ้าใช้ controller ของ LMDS: `./deepseek-v4-flash-nvfp4-stacked.sh test-text`
 
 ---
+
+## พังแล้วดูตรงไหน
+
+| อาการ | ตรวจ |
+|---|---|
+| `/health` ไม่ตอบสักที | โมเดลใหญ่โหลดนานหลายนาที — ดู log ก่อนสรุปว่าค้าง |
+| OOM ตอน warm-up | ลด `--gpu-memory-utilization` ทีละ 0.05 |
+| `LocalEntryNotFoundError` ทั้งที่ไฟล์ครบ | HF cache อยู่คนละเลย์เอาต์ — ตั้ง `HF_HUB_CACHE` ให้ตรง |
+| ดาวน์โหลดค้าง/ไฟล์ไม่ครบ | `verify-files` แล้ว `download` ซ้ำ (resume ได้) |
+| ไม่รู้ว่ามีโมเดลอยู่ในเครื่องแล้วหรือยัง | `lmds scan` |
+
+| `LocalEntryNotFoundError` ทั้งที่ไฟล์ครบ | HF cache อยู่คนละ layout — `lmds scan` จะบอกว่าอยู่แบบไหน |
+| `only supports fp8 kv-cache, got auto` | ไม่ได้ตั้ง `--kv-cache-dtype fp8` |
+| `Mismatched number of arguments` ตอน load | JIT cache ค้างจากคนละเวอร์ชัน — `clear-fi-cache` |
+| image ต่างกันระหว่างเครื่อง | `prepare-runtime` ล็อก image ให้ตรงกันทุก node |
+
+---
+
+## ที่มาและขอบเขต
+
+- อ้างอิงจากการรันจริงบน DGX Spark 2 เครื่อง (5 ส.ค. 2569)
+- `lmds recipes nvidia/DeepSeek-V4-Flash-NVFP4` มีค่าทั้งหมดนี้อยู่แล้ว — ไม่ต้องจำเอง
+
+> **สถานะ**: ค่าที่ระบุในหน้านี้มาจากการรันจริงบนฮาร์ดแวร์ที่ระบุไว้ ไม่ใช่การประเมิน
+> เครื่องต่างรุ่นอาจต้องปรับ context และ `--gpu-memory-utilization` เอง
+
+## อ่านต่อ
+
+- [AutoDeployDGXProject](https://github.com/neronain/AutoDeployDGXProject) — ตัวสร้าง controller อัตโนมัติจากลิงก์ Hugging Face
+- [dgx-spark-all-controllers](https://github.com/neronain/dgx-spark-all-controllers) — controller สำเร็จรูป 22 ตัวสำหรับ DGX Spark
