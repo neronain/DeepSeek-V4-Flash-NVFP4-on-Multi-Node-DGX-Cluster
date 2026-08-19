@@ -80,14 +80,12 @@ curl -s http://localhost:8000/v1/chat/completions \
 |---|---|
 | `/health` ไม่ตอบสักที | โมเดลใหญ่โหลดนานหลายนาที — ดู log ก่อนสรุปว่าค้าง |
 | OOM ตอน warm-up | ลด `--gpu-memory-utilization` ทีละ 0.05 |
-| `LocalEntryNotFoundError` ทั้งที่ไฟล์ครบ | HF cache อยู่คนละเลย์เอาต์ — ตั้ง `HF_HUB_CACHE` ให้ตรง |
-| ดาวน์โหลดค้าง/ไฟล์ไม่ครบ | `verify-files` แล้ว `download` ซ้ำ (resume ได้) |
-| ไม่รู้ว่ามีโมเดลอยู่ในเครื่องแล้วหรือยัง | `lmds scan` |
-
-| `LocalEntryNotFoundError` ทั้งที่ไฟล์ครบ | HF cache อยู่คนละ layout — `lmds scan` จะบอกว่าอยู่แบบไหน |
-| `only supports fp8 kv-cache, got auto` | ไม่ได้ตั้ง `--kv-cache-dtype fp8` |
+| `LocalEntryNotFoundError` ทั้งที่ไฟล์ครบ | HF cache อยู่คนละ layout — ตั้ง `HF_HUB_CACHE` ให้ตรง (`lmds scan` บอกได้ว่าอยู่แบบไหน) |
+| `only supports fp8 kv-cache, got auto` | ยังไม่ได้ตั้ง `--kv-cache-dtype fp8` |
 | `Mismatched number of arguments` ตอน load | JIT cache ค้างจากคนละเวอร์ชัน — `clear-fi-cache` |
-| image ต่างกันระหว่างเครื่อง | `prepare-runtime` ล็อก image ให้ตรงกันทุก node |
+| image ต่างกันระหว่างสองเครื่อง | `prepare-runtime` ล็อก image ให้ตรงกันทุก node |
+| ดาวน์โหลดค้าง / ไฟล์ไม่ครบ | `verify-files` แล้วสั่ง `download` ซ้ำ (resume ได้) |
+| ไม่รู้ว่ามีโมเดลอยู่ในเครื่องแล้วหรือยัง | `lmds scan` |
 
 ---
 

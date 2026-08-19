@@ -36,6 +36,9 @@ fi
 MASTER_IP="${MASTER_IP:-10.100.152.1}"
 WORKER_IP="${WORKER_IP:-10.100.152.2}"
 SSH_USER="${SSH_USER:-${USER:-$(id -un)}}"
+# จำว่า WORKER_IPS / transport IP มาจาก env จริงไหม (ก่อนใส่ default ด้านล่าง) — ตอน interactive
+# prompt จะได้ recompute จาก IP ที่เพิ่งกรอกได้ โดยไม่ทับค่า override ที่ผู้ใช้ตั้งมาจาก env
+_ENV_WORKER_IPS="${WORKER_IPS:-}"; _ENV_TIM="${TRANSPORT_IP_MASTER:-}"; _ENV_TIW="${TRANSPORT_IP_WORKER:-}"
 # คลัสเตอร์ที่มากกว่า 2 เครื่อง: ใส่ IP ของ worker ทุกตัวคั่นด้วยช่องว่าง เรียงตาม node-rank
 # (rank 1, 2, 3 …) · ค่าเริ่มต้นคือ worker เดียว = พฤติกรรมเดิมทุกประการ
 WORKER_IPS="${WORKER_IPS:-$WORKER_IP}"
@@ -536,6 +539,9 @@ build_common_args() {
   )
   if [[ -n "$KV_CACHE_DTYPE" && "$KV_CACHE_DTYPE" != "auto" ]]; then
     COMMON_ARGS+=(--kv-cache-dtype "$KV_CACHE_DTYPE")
+  else
+    # โมเดลนี้บังคับ fp8 — attention layout fp8_ds_mla ไม่รับ auto (AssertionError ตอน start)
+    log "WARN: KV_CACHE_DTYPE='${KV_CACHE_DTYPE}' — DeepSeek-V4-Flash ต้องใช้ fp8 เท่านั้น ไม่งั้น start ไม่ขึ้น"
   fi
   if [[ -n "$MOE_BACKEND" ]]; then
     COMMON_ARGS+=(--moe-backend "$MOE_BACKEND")
@@ -642,8 +648,11 @@ prompt_cluster_config() {
   read -rp "  Head (master) node IP [${MASTER_IP}]: " ans || true; [[ -z "$ans" ]] || MASTER_IP="$ans"
   read -rp "  Worker node IP        [${WORKER_IP}]: " ans || true; [[ -z "$ans" ]] || WORKER_IP="$ans"
   read -rp "  SSH user for nodes    [${SSH_USER}]: " ans || true; [[ -z "$ans" ]] || SSH_USER="$ans"
-  TRANSPORT_IP_MASTER="${TRANSPORT_IP_MASTER:-$MASTER_IP}"
-  TRANSPORT_IP_WORKER="${TRANSPORT_IP_WORKER:-$WORKER_IP}"
+  # prompt เพิ่งแก้ IP → ตัวแปรที่ derive ไว้ตอนโหลดยังชี้ค่าเดิม ต้องคำนวณใหม่จาก IP ที่กรอก
+  # (เว้นแต่ผู้ใช้ตั้ง env มาเอง ถึงจะเคารพค่านั้น) ไม่งั้น preflight กับ launch จะยิงคนละเครื่อง
+  WORKER_IPS="${_ENV_WORKER_IPS:-$WORKER_IP}"
+  TRANSPORT_IP_MASTER="${_ENV_TIM:-$MASTER_IP}"
+  TRANSPORT_IP_WORKER="${_ENV_TIW:-$WORKER_IP}"
   printf '\n'
 }
 
@@ -718,7 +727,12 @@ clear_fi_cache() {
   log "ล้างครบทั้งสอง node แล้ว"
 }
 
-props() { curl -fsS "http://127.0.0.1:${API_PORT}/v1/models" | python3 -m json.tool; }
+props() {
+  # ต้องแนบ API key เหมือน status()/test_text() — vLLM ปิด /v1/* เมื่อมีการตั้ง key
+  # ไม่งั้น -fsS จะเจอ 401 แล้ว exit non-zero
+  curl -fsS ${API_KEY:+-H "Authorization: Bearer $API_KEY"} \
+    "http://127.0.0.1:${API_PORT}/v1/models" | python3 -m json.tool
+}
 
 start() {
   _require_non_root
@@ -800,8 +814,10 @@ $(_nccl_env_pairs "$wifname" 2>/dev/null | grep -v '^WARN:' | sed 's/^/export /'
 exec vllm${quoted_common} --node-rank ${rank} --host 127.0.0.1 --port 18000 --headless
 WSCRIPT
 )"
-    ssh_at "$wip" "mkdir -p /tmp/lmds-${SLUG} && cat > /tmp/lmds-${SLUG}/worker.sh" <<< "$worker_script"
-    ssh_at "$wip" "chmod +x /tmp/lmds-${SLUG}/worker.sh"
+    ssh_at "$wip" "mkdir -p /tmp/lmds-${SLUG} && cat > /tmp/lmds-${SLUG}/worker.sh" <<< "$worker_script" \
+      || die "เขียน worker.sh บน ${wip} ไม่ได้ — ตรวจ SSH/สิทธิ์เขียน /tmp"
+    ssh_at "$wip" "chmod +x /tmp/lmds-${SLUG}/worker.sh" \
+      || die "chmod worker.sh บน ${wip} ไม่ได้"
     local -a wrun=(
       docker run -d --name "${WORKER_CONTAINER}"
       --gpus all --network host --ipc host
@@ -1014,7 +1030,7 @@ else:
 
 usage() {
   cat <<EOF
-{{ slug }} — vLLM stacked (multi-node) controller  (model: ${MODEL_ID})
+${SLUG} — vLLM stacked (multi-node) controller  (model: ${MODEL_ID})
 
 USAGE
   $0 <command> [options]
@@ -1123,7 +1139,7 @@ info() {
   printf '  Model ID  : %s\n'            "${MODEL_ID}"
   printf '  Runtime   : %s\n'            "${RUNTIME_LABEL}"
   printf '  Features  : %s\n'            "${MODEL_FEATURES}"
-  printf '  Context   : %s tokens\n'     "${MAX_MODEL_LEN:-${CTX_SIZE:-n/a}}"
+  printf '  Context   : %s tokens\n'     "${MAX_MODEL_LEN:-n/a}"
   printf '  API (v1)  : %s\n'            "${url}"
   printf '  State     : %s  (port %s)\n\n' "${state}" "${API_PORT}"
 }
